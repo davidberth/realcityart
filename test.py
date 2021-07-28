@@ -61,7 +61,8 @@ def getTableCoordinates(cursor, table, minlon, maxlon, minlat, maxlat, buffer=No
     coords = [np.array(rec[0][0][0]) for rec in records]
     return coords
 
-def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=None, gscale=1.0):
+def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=None, gscale=1.0,
+               color=None):
 
     meshes = []
     coordsList = getTableCoordinates(cursor, table, minlon, maxlon, minlat, maxlat, buffer)
@@ -70,7 +71,6 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
     xx = []
     yy = []
     for coordsl in coordsList:
-
 
         lon, lat = np.mean(coordsl, axis=0)
         xx.append(lon)
@@ -83,12 +83,6 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
         poly = trimesh.path.polygons.edges_to_polygons(edges, coords)[0]
         scale = trimesh.path.polygons.polygon_scale(poly)
         mesh = trimesh.creation.extrude_polygon(poly, scale*gscale)
-
-        red = random.randint(0, 255)
-        #green = random.randint(0, 255)
-        #blue = random.randint(0, 255)
-
-
         meshes.append(mesh)
 
     xx = xr.DataArray(xx, dims="points")
@@ -99,9 +93,11 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
     print ('translating meshes')
     for mesh, elev in zip(meshes, elevs):
         mesh.vertices[:, 2]+=elev * 2.0
-        red = random.randint(0, 255)
-        mesh.visual.mesh.visual.face_colors = [red, red, red, 200]
-
+        if color is None:
+            red = random.randint(0, 255)
+            mesh.visual.mesh.visual.face_colors = [red, red, red, 200]
+        else:
+            mesh.visual.mesh.visual.face_colors = [*color, 200]
     return meshes
 
 def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
@@ -142,11 +138,15 @@ def renderScene():
     downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat)
     elevation = xr.open_rasterio(os.path.join(baseRasterPath, 'elevation.tif'))[0, :, :]
 
-    print ('adding layer building')
     meshes = []
+    print ('adding layer building')
     meshes.extend(buildLayer(cursor, 'building', minlon, maxlon, minlat, maxlat, elevation))
     print ('adding layer road')
-    meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat, elevation, buffer=5, gscale=0.002))
+    meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat, elevation, buffer=5, gscale=0.002, color=(0,0,0)))
+    print ('adding layer water')
+    meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat, elevation, gscale=0.002, color=(0,0,255)))
+
+
     mesh = trimesh.util.concatenate(meshes)
     trimesh.exchange.export.export_mesh(mesh, 'test.glb', file_type='glb')
 
