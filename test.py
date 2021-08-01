@@ -9,8 +9,13 @@ import os
 import xarray as xr
 import pickle
 import pyrender
-import transforms3d
+from pymartini import Martini
+from skimage.transform import resize
+import math
 
+
+
+#address = '7 donnelly rd spencer, ma'
 address = '100 institute rd worcester, ma'
 width, height = 1000, 1000
 radius = 0.01
@@ -41,27 +46,37 @@ def getLocationCoordinates(address):
     return centerlon, centerlat, minlon, minlat, maxlon, maxlat
 
 def getTableCoordinates(cursor, table, minlon, maxlon, minlat, maxlat, buffer=None):
-    sql = f"SELECT "
     if buffer is None:
-        sql+= "ST_AsGeoJSON(geom) :: json->'coordinates' AS coordinates "
-    else:
-        sql+= f"ST_AsGeoJSON(st_multi(st_buffer(st_segmentize(geom, 0.00027), " \
-              f"{buffer / 111000.0}))) :: json->'coordinates' AS coordinates "
-    sql+= f"""
-    FROM
-      publicdata.{table} where 
-      pc_centerlon > {minlon} and 
-      pc_centerlon < {maxlon} and 
-      pc_centerlat > {minlat} and 
-      pc_centerlat < {maxlat} limit 3000;"""
 
+        sql = f"""SELECT st_asgeojson(st_intersection(geom, 
+                st_makeenvelope({minlon}, {minlat}, {maxlon}, {maxlat}, 4326)))  
+          :: json->'coordinates' AS coordinates
+          FROM
+            publicdata.{table} where 
+            pc_centerlon > {minlon} and 
+            pc_centerlon < {maxlon} and 
+            pc_centerlat > {minlat} and 
+            pc_centerlat < {maxlat} limit 3000;"""
+
+    else:
+        sql = f"""WITH segments AS (
+        SELECT _gid, ST_AsText(ST_MakeLine(lag((pt).geom, 1, NULL) OVER (PARTITION BY _gid ORDER BY _gid, (pt).path), (pt).geom)) AS geom
+        FROM (SELECT _gid, ST_DumpPoints(st_segmentize(geom, 0.00155)) AS pt FROM publicdata.road where pc_centerlon > {minlon} and
+           pc_centerlon < {maxlon} and
+           pc_centerlat > {minlat} and
+           pc_centerlat < {maxlat}) as dumps
+        )
+        SELECT st_asgeojson(st_intersection(st_setsrid(st_buffer(geom, 0.00007, 2), 4326), 
+        st_makeenvelope({minlon}, {minlat}, {maxlon}, {maxlat}, 4326))
+        ) :: json->'coordinates' as coordinates  FROM segments WHERE geom IS NOT NULL;
+        """
 
     cursor.execute(sql)
     records = cursor.fetchall()
-    coords = [np.array(rec[0][0][0]) for rec in records]
+    coords = [np.array(rec[0][0]) for rec in records if rec is not None and rec[0] is not None]
     return coords
 
-def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=None, gscale=1.0,
+def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=None, gscale=0.0,
                color=None):
 
     meshes = []
@@ -72,27 +87,37 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
     yy = []
     for coordsl in coordsList:
 
-        lon, lat = np.mean(coordsl, axis=0)
+        scoords = coordsl.squeeze()
+        lon, lat = np.mean(scoords, axis=0)
         xx.append(lon)
         yy.append(lat)
-        coords = (coordsl[:-1] - centerCoord) * (111000.0)
+        coords = (scoords[:-1] - centerCoord) * (111000.0)
         numCoords = coords.shape[0]
         edges = np.array([np.arange(0, numCoords), np.arange(1, numCoords+1)]).T
         edges[-1,1] = 0
 
         poly = trimesh.path.polygons.edges_to_polygons(edges, coords)[0]
         scale = trimesh.path.polygons.polygon_scale(poly)
-        mesh = trimesh.creation.extrude_polygon(poly, scale*gscale)
+        if gscale < 0.001:
+            mesh = trimesh.creation.extrude_polygon(poly, scale)
+        else:
+            mesh = trimesh.creation.extrude_polygon(poly, gscale)
         meshes.append(mesh)
 
     xx = xr.DataArray(xx, dims="points")
     yy = xr.DataArray(yy, dims="points")
     elevs = elevation.interp(x=xx,y=yy, method='nearest').values
+
+
     print (elevs.shape)
     print (' done sampling the elevation')
     print ('translating meshes')
+
     for mesh, elev in zip(meshes, elevs):
-        mesh.vertices[:, 2]+=elev * 2.0
+        melev = elev
+        if math.isnan(elev):
+            melev = 150.0
+        mesh.vertices[:, 2]+=melev * 2.0
         if color is None:
             red = random.randint(0, 255)
             mesh.visual.mesh.visual.face_colors = [red, red, red, 200]
@@ -104,7 +129,6 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
     sameLocation = False
 
     try:
-        file = open(os.path.join(baseRasterPath, 'coords.p'), "rb")
         caCenterlon, caCenterlat = pickle.load(open(os.path.join(baseRasterPath, 'coords.p'), "rb"))
         if abs(caCenterlon - centerlon) < 0.0001 and abs(caCenterlat - centerlat) < 0.0001:
             sameLocation = True
@@ -128,6 +152,44 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
         rasterList, rasterOutList = public.importPublic(ctx, '', bbox, [], 0, {'elevation': 'elevation'}, False)
         globimage.importRasters(rasterList, baseRasterPath, bbox, outNames=rasterOutList)
 
+def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
+
+    # we now need to make this array square.
+    elx, ely = elevation.shape
+    elx = elx-1
+    ely = ely-1
+    elevationSquare = resize(elevation.values, (1025, 1025)).astype(np.float32).T * scale
+
+    martini = Martini(1025)
+    # generate RTIN hierarchy from terrain data (an array of size^2 length)
+    tile = martini.create_tile(elevationSquare)
+
+    # get a mesh (vertices and triangles indices) for a 10m error
+    print ('generating terrain')
+    vertices, triangles = tile.get_mesh(.0005)
+    print ('done')
+
+    vertices = vertices.reshape((int(vertices.shape[0]/2), 2))
+    triangles = triangles.reshape((int(triangles.shape[0]/3), 3))
+    elevationSamples = elevationSquare[vertices[:,0], vertices[:,1]]
+
+    verts = np.vstack((vertices.T, elevationSamples)).T
+
+    print (minlon, maxlon, minlat, maxlat)
+    mincoords = elevation[0,0].coords
+    maxcoords = elevation[elx, ely].coords
+    rminx, rminy = mincoords['x'].values, mincoords['y'].values
+    rmaxx, rmaxy = maxcoords['x'].values, maxcoords['y'].values
+
+    verts[:, 0] = ((verts[:, 0]/1025.0) - 0.5) * (rmaxx - rminx) * 111000.0
+    verts[:, 1] = ((verts[:, 1]/1025.0) - 0.5) * (rmaxy - rminy) * 111000.0
+    #triangles = np.flip(triangles, axis=1)
+
+    terrain = trimesh.base.Trimesh(vertices=verts, faces=triangles)
+
+    terrain.visual.mesh.visual.face_colors = [200, 200, 200, 200]
+
+    return [terrain]
 
 def renderScene():
 
@@ -142,13 +204,15 @@ def renderScene():
     print ('adding layer building')
     meshes.extend(buildLayer(cursor, 'building', minlon, maxlon, minlat, maxlat, elevation))
     print ('adding layer road')
-    meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat, elevation, buffer=5, gscale=0.002, color=(0,0,0)))
+    meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat, elevation, buffer=5, gscale=1.0, color=(0,0,0)))
     print ('adding layer water')
-    meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat, elevation, gscale=0.002, color=(0,0,255)))
-
+    meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat, elevation, gscale=7.5, color=(0,122,255)))
+    print ('creating terrain mesh')
+    meshes.extend(buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 2.0))
 
     mesh = trimesh.util.concatenate(meshes)
-    trimesh.exchange.export.export_mesh(mesh, 'test.glb', file_type='glb')
+    #mesh.show()
+    #trimesh.exchange.export.export_mesh(mesh, 'test.glb', file_type='glb')
 
 
     pyrenderMesh = pyrender.Mesh.from_trimesh(mesh, smooth=False)
@@ -163,3 +227,21 @@ def renderScene():
 
 renderScene()
 
+#WITH segments AS (
+#SELECT _gid, ST_AsText(ST_MakeLine(lag((pt).geom, 1, NULL) OVER (PARTITION BY _gid ORDER BY _gid, (pt).path), (pt).geom)) AS geom
+#  FROM (SELECT _gid, ST_DumpPoints(st_segmentize(geom, 0.0003)) AS pt FROM publicdata.road where pc_centerlon > -71.8186703935037 and
+#      pc_centerlon < -71.79867039350368 and
+#      pc_centerlat > 42.264305900000004 and
+#      pc_centerlat < 42.2843059) as dumps
+#)
+#SELECT * FROM segments WHERE geom IS NOT NULL;
+
+
+# WITH segments AS (
+# SELECT _gid, ST_AsText(ST_MakeLine(lag((pt).geom, 1, NULL) OVER (PARTITION BY _gid ORDER BY _gid, (pt).path), (pt).geom)) AS geom
+#   FROM (SELECT _gid, ST_DumpPoints(st_segmentize(geom, 0.0003)) AS pt FROM publicdata.road where pc_centerlon > -71.8186703935037 and
+#       pc_centerlon < -71.79867039350368 and
+#       pc_centerlat > 42.264305900000004 and
+#       pc_centerlat < 42.2843059) as dumps
+# )
+# SELECT st_buffer(geom, 0.0001) FROM segments WHERE geom IS NOT NULL;
