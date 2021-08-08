@@ -3,7 +3,7 @@ import psycopg2
 import geocoder
 import trimesh
 import random
-from gcube import public, globimage, context
+from gcube import public, globimage, context#
 import glob
 import os
 import xarray as xr
@@ -12,11 +12,21 @@ import pyrender
 from pymartini import Martini
 from skimage.transform import resize
 import math
+import tree
+import socket
 
 
+IPaddress=socket.gethostbyname(socket.gethostname())
+if IPaddress=="127.0.0.1":
+    print("No internet, your localhost is "+ IPaddress)
+    haveInternet = False
+else:
+    print("Connected, with the IP address: "+ IPaddress )
+    haveInternet = True
 
 #address = '7 donnelly rd spencer, ma'
-address = '100 institute rd worcester, ma'
+#address = '1350 Massachusetts Ave, Cambridge, MA 02138'
+address = '266 Harding St Worcester, MA 01610'
 width, height = 1000, 1000
 radius = 0.01
 diameter = radius * 2.0
@@ -35,9 +45,12 @@ def initDBConnection():
     return conn, cursor
 
 def getLocationCoordinates(address):
-    g = geocoder.osm(address).json
-    centerlon, centerlat = g['lng'], g['lat']
-
+    if haveInternet:
+        g = geocoder.osm(address).json
+        centerlon, centerlat = g['lng'], g['lat']
+        print (centerlon, centerlat)
+    else:
+        centerLon, centerLat = pickle.load(open(os.path.join(baseRasterPath, 'coords.p'), "rb"))
     minlon = centerlon - radius
     minlat = centerlat - radius
     maxlon = centerlon + radius
@@ -106,6 +119,9 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
 
     xx = xr.DataArray(xx, dims="points")
     yy = xr.DataArray(yy, dims="points")
+
+    if len(xx) == 0:
+        return []
     elevs = elevation.interp(x=xx,y=yy, method='nearest').values
 
 
@@ -120,17 +136,21 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
         mesh.vertices[:, 2]+=melev * 2.0
         if color is None:
             red = random.randint(0, 255)
-            mesh.visual.mesh.visual.face_colors = [red, red, red, 200]
+            mesh.visual.mesh.visual.face_colors = [red, red, red, 255]
         else:
-            mesh.visual.mesh.visual.face_colors = [*color, 200]
+            mesh.visual.mesh.visual.face_colors = [*color, 255]
     return meshes
 
 def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
     sameLocation = False
 
+    rasters = {'elevation':'elevation',
+               'tree':'tree'}
+
+
     try:
         caCenterlon, caCenterlat = pickle.load(open(os.path.join(baseRasterPath, 'coords.p'), "rb"))
-        if abs(caCenterlon - centerlon) < 0.0001 and abs(caCenterlat - centerlat) < 0.0001:
+        if abs(caCenterlon - centerlon) < 0.0005 and abs(caCenterlat - centerlat) < 0.0005:
             sameLocation = True
     except:
         print('No coords.p file found.')
@@ -148,8 +168,9 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
 
         pickle.dump([centerlon, centerlat], open(os.path.join(baseRasterPath, 'coords.p'), "wb"))
         bbox = [minlon, maxlon, minlat, maxlat]
-        ctx = context.Context(args=[], currentProcess='art')
-        rasterList, rasterOutList = public.importPublic(ctx, '', bbox, [], 0, {'elevation': 'elevation'}, False)
+        if haveInternet:
+            ctx = context.Context(args=[], currentProcess='art')
+            rasterList, rasterOutList = public.importPublic(ctx, '', bbox, [], 0, rasters, False)
         globimage.importRasters(rasterList, baseRasterPath, bbox, outNames=rasterOutList)
 
 def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
@@ -166,8 +187,7 @@ def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
 
     # get a mesh (vertices and triangles indices) for a 10m error
     print ('generating terrain')
-    vertices, triangles = tile.get_mesh(.0005)
-    print ('done')
+    vertices, triangles = tile.get_mesh(.00003)
 
     vertices = vertices.reshape((int(vertices.shape[0]/2), 2))
     triangles = triangles.reshape((int(triangles.shape[0]/3), 3))
@@ -187,28 +207,34 @@ def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
 
     terrain = trimesh.base.Trimesh(vertices=verts, faces=triangles)
 
-    terrain.visual.mesh.visual.face_colors = [200, 200, 200, 200]
+    terrain.visual.mesh.visual.face_colors = [230, 230, 230, 80]
 
     return [terrain]
 
 def renderScene():
 
-    meshes = []
+
     conn, cursor = initDBConnection()
     centerlon, centerlat, minlon, minlat, maxlon, maxlat = getLocationCoordinates(address)
 
-    downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat)
+    if haveInternet:
+        downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat)
     elevation = xr.open_rasterio(os.path.join(baseRasterPath, 'elevation.tif'))[0, :, :]
 
     meshes = []
-    print ('adding layer building')
-    meshes.extend(buildLayer(cursor, 'building', minlon, maxlon, minlat, maxlat, elevation))
-    print ('adding layer road')
-    meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat, elevation, buffer=5, gscale=1.0, color=(0,0,0)))
-    print ('adding layer water')
-    meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat, elevation, gscale=7.5, color=(0,122,255)))
-    print ('creating terrain mesh')
+    if haveInternet:
+        print ('adding layer building')
+        meshes.extend(buildLayer(cursor, 'building', minlon, maxlon, minlat, maxlat, elevation))
+        print ('adding layer road')
+        meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat,
+                                 elevation, buffer=5, gscale=2.0, color=(0,0,0)))
+        print ('adding layer water')
+        meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat,
+                                 elevation, gscale=7.5, color=(0,70,255)))
+        print ('creating terrain mesh')
     meshes.extend(buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 2.0))
+
+    meshes.extend(tree.addTrees(elevation, centerlon, centerlat))
 
     mesh = trimesh.util.concatenate(meshes)
     #mesh.show()
@@ -222,26 +248,11 @@ def renderScene():
     #pose = transforms3d.affines.compose(np.zeros(3), np.eye(3), np.ones(3), np.zeros(3))
 
     #scene.add(camera, pose=pose)
-    pyrender.Viewer(scene, viewport_size=(1500, 700), use_raymond_lighting=True, shadows=True)
+    pyrender.Viewer(scene, viewport_size=(1500, 700),
+                    use_raymond_lighting=True,
+                    shadows=True,
+                    window_title = 'World builder v0.1a - David Berthiaume')
 
 
 renderScene()
 
-#WITH segments AS (
-#SELECT _gid, ST_AsText(ST_MakeLine(lag((pt).geom, 1, NULL) OVER (PARTITION BY _gid ORDER BY _gid, (pt).path), (pt).geom)) AS geom
-#  FROM (SELECT _gid, ST_DumpPoints(st_segmentize(geom, 0.0003)) AS pt FROM publicdata.road where pc_centerlon > -71.8186703935037 and
-#      pc_centerlon < -71.79867039350368 and
-#      pc_centerlat > 42.264305900000004 and
-#      pc_centerlat < 42.2843059) as dumps
-#)
-#SELECT * FROM segments WHERE geom IS NOT NULL;
-
-
-# WITH segments AS (
-# SELECT _gid, ST_AsText(ST_MakeLine(lag((pt).geom, 1, NULL) OVER (PARTITION BY _gid ORDER BY _gid, (pt).path), (pt).geom)) AS geom
-#   FROM (SELECT _gid, ST_DumpPoints(st_segmentize(geom, 0.0003)) AS pt FROM publicdata.road where pc_centerlon > -71.8186703935037 and
-#       pc_centerlon < -71.79867039350368 and
-#       pc_centerlat > 42.264305900000004 and
-#       pc_centerlat < 42.2843059) as dumps
-# )
-# SELECT st_buffer(geom, 0.0001) FROM segments WHERE geom IS NOT NULL;
