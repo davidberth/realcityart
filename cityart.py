@@ -3,7 +3,6 @@ import psycopg2
 import geocoder
 import trimesh
 import random
-from gcube import public, globimage, context#
 import glob
 import os
 import xarray as xr
@@ -13,44 +12,33 @@ from pymartini import Martini
 from skimage.transform import resize
 import math
 import tree
-import socket
-
-
-IPaddress=socket.gethostbyname(socket.gethostname())
-if IPaddress=="127.0.0.1":
-    print("No internet, your localhost is "+ IPaddress)
-    haveInternet = False
-else:
-    print("Connected, with the IP address: "+ IPaddress )
-    haveInternet = True
+import raster
 
 #address = '7 donnelly rd spencer, ma'
 #address = '1350 Massachusetts Ave, Cambridge, MA 02138'
+#address = 'chicago, IL'
 address = '266 Harding St Worcester, MA 01610'
-width, height = 1000, 1000
-radius = 0.01
+#address = '166 Harding St Worcester, MA 01610'
+width, height = 1500, 1000
+radius = 0.02
 diameter = radius * 2.0
-output = "c:/art/out/test.png"
-offscreen = False
 baseRasterPath = 'c:/art/raster'
 
 def initDBConnection():
     conn = psycopg2.connect(
-        host="papercrane-data.ch88iboltgdp.us-east-2.rds.amazonaws.com",
+        host="localhost",
         database="data",
         user="postgres",
-        password="EbvanYJnl0F3Jqqgg3Nx")
+        password="gcube")
 
     cursor = conn.cursor()
     return conn, cursor
 
 def getLocationCoordinates(address):
-    if haveInternet:
-        g = geocoder.osm(address).json
-        centerlon, centerlat = g['lng'], g['lat']
-        print (centerlon, centerlat)
-    else:
-        centerLon, centerLat = pickle.load(open(os.path.join(baseRasterPath, 'coords.p'), "rb"))
+
+    g = geocoder.osm(address).json
+    centerlon, centerlat = g['lng'], g['lat']
+    print (centerlon, centerlat)
     minlon = centerlon - radius
     minlat = centerlat - radius
     maxlon = centerlon + radius
@@ -69,7 +57,7 @@ def getTableCoordinates(cursor, table, minlon, maxlon, minlat, maxlat, buffer=No
             pc_centerlon > {minlon} and 
             pc_centerlon < {maxlon} and 
             pc_centerlat > {minlat} and 
-            pc_centerlat < {maxlat} limit 3000;"""
+            pc_centerlat < {maxlat};"""
 
     else:
         sql = f"""WITH segments AS (
@@ -86,7 +74,8 @@ def getTableCoordinates(cursor, table, minlon, maxlon, minlat, maxlat, buffer=No
 
     cursor.execute(sql)
     records = cursor.fetchall()
-    coords = [np.array(rec[0][0]) for rec in records if rec is not None and rec[0] is not None]
+    coords = [np.array(rec[0][0]) for rec in records if rec is not None and len(rec) > 0 and
+              rec[0] is not None and len(rec[0]) > 0]
     return coords
 
 def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=None, gscale=0.0,
@@ -141,11 +130,10 @@ def buildLayer(cursor, table, minlon, maxlon, minlat, maxlat, elevation, buffer=
             mesh.visual.mesh.visual.face_colors = [*color, 255]
     return meshes
 
-def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
+def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat, cursor):
     sameLocation = False
 
-    rasters = {'elevation':'elevation',
-               'tree':'tree'}
+    rasters = ['elevation', 'tree']
 
 
     try:
@@ -154,6 +142,8 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
             sameLocation = True
     except:
         print('No coords.p file found.')
+
+    sameLocation = False
 
     if not sameLocation:
         files = glob.glob(os.path.join(baseRasterPath, '*.tif'))
@@ -168,10 +158,10 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat):
 
         pickle.dump([centerlon, centerlat], open(os.path.join(baseRasterPath, 'coords.p'), "wb"))
         bbox = [minlon, maxlon, minlat, maxlat]
-        if haveInternet:
-            ctx = context.Context(args=[], currentProcess='art')
-            rasterList, rasterOutList = public.importPublic(ctx, '', bbox, [], 0, rasters, False)
-        globimage.importRasters(rasterList, baseRasterPath, bbox, outNames=rasterOutList)
+
+        rasterList = raster.getRasterList(rasters, bbox, cursor)
+        localRasterList = raster.s3ToLocal(rasterList)
+        raster.importRasters(localRasterList, baseRasterPath, bbox, outNames=rasters)
 
 def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
 
@@ -217,21 +207,19 @@ def renderScene():
     conn, cursor = initDBConnection()
     centerlon, centerlat, minlon, minlat, maxlon, maxlat = getLocationCoordinates(address)
 
-    if haveInternet:
-        downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat)
+    downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat, cursor)
     elevation = xr.open_rasterio(os.path.join(baseRasterPath, 'elevation.tif'))[0, :, :]
 
     meshes = []
-    if haveInternet:
-        print ('adding layer building')
-        meshes.extend(buildLayer(cursor, 'building', minlon, maxlon, minlat, maxlat, elevation))
-        print ('adding layer road')
-        meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat,
-                                 elevation, buffer=5, gscale=2.0, color=(0,0,0)))
-        print ('adding layer water')
-        meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat,
-                                 elevation, gscale=7.5, color=(0,70,255)))
-        print ('creating terrain mesh')
+    print ('adding layer building')
+    meshes.extend(buildLayer(cursor, 'building', minlon, maxlon, minlat, maxlat, elevation))
+    print ('adding layer road')
+    meshes.extend(buildLayer(cursor, 'road', minlon, maxlon, minlat, maxlat,
+                             elevation, buffer=5, gscale=2.0, color=(0,0,0)))
+    print ('adding layer water')
+    meshes.extend(buildLayer(cursor, 'water', minlon, maxlon, minlat, maxlat,
+                             elevation, gscale=7.5, color=(0,70,255)))
+    print ('creating terrain mesh')
     meshes.extend(buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 2.0))
 
     meshes.extend(tree.addTrees(elevation, centerlon, centerlat))
@@ -248,11 +236,12 @@ def renderScene():
     #pose = transforms3d.affines.compose(np.zeros(3), np.eye(3), np.ones(3), np.zeros(3))
 
     #scene.add(camera, pose=pose)
-    pyrender.Viewer(scene, viewport_size=(1500, 700),
+    pyrender.Viewer(scene, viewport_size=(width, height),
                     use_raymond_lighting=True,
                     shadows=True,
                     window_title = 'World builder v0.1a - David Berthiaume')
 
+    conn.close()
 
 renderScene()
 
