@@ -1,6 +1,5 @@
 import numpy as np
 import psycopg2
-import geocoder
 import trimesh
 import random
 import glob
@@ -17,10 +16,12 @@ import raster
 #address = '7 donnelly rd spencer, ma'
 #address = '1350 Massachusetts Ave, Cambridge, MA 02138'
 #address = 'chicago, IL'
-address = '266 Harding St Worcester, MA 01610'
-#address = '166 Harding St Worcester, MA 01610'
+#address = '266 Harding St Worcester, MA 01610'
+address = '166 harding St: Worcester: MA '
+
+
 width, height = 1500, 1000
-radius = 0.02
+radius = 0.01
 diameter = radius * 2.0
 baseRasterPath = 'c:/art/raster'
 
@@ -34,10 +35,28 @@ def initDBConnection():
     cursor = conn.cursor()
     return conn, cursor
 
-def getLocationCoordinates(address):
+def getLocationCoordinates(address, cursor):
 
-    g = geocoder.osm(address).json
-    centerlon, centerlat = g['lng'], g['lat']
+    # convert the address string into formated street, city, state strings.
+    addressItems = address.split(':')
+    street = addressItems[0].strip().title()
+    city = addressItems[1].strip().title()
+    state = addressItems[2].strip().upper()
+
+    print (street, city, state)
+    sql = f"select pc_centerlon, pc_centerlat from publicdata.address where address = '{street}' and city = '{city}'" \
+          f" and state = '{state}'"
+
+    print (f'looking up address {street}, {city}, {state}')
+
+    cursor.execute(sql)
+    res = cursor.fetchall()
+
+    print ('done')
+
+    centerlon, centerlat = res[0]
+
+
     print (centerlon, centerlat)
     minlon = centerlon - radius
     minlat = centerlat - radius
@@ -143,8 +162,6 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat, cursor
     except:
         print('No coords.p file found.')
 
-    sameLocation = False
-
     if not sameLocation:
         files = glob.glob(os.path.join(baseRasterPath, '*.tif'))
         files.extend(glob.glob(os.path.join(baseRasterPath, '*.xml')))
@@ -193,7 +210,6 @@ def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
 
     verts[:, 0] = ((verts[:, 0]/1025.0) - 0.5) * (rmaxx - rminx) * 111000.0
     verts[:, 1] = ((verts[:, 1]/1025.0) - 0.5) * (rmaxy - rminy) * 111000.0
-    #triangles = np.flip(triangles, axis=1)
 
     terrain = trimesh.base.Trimesh(vertices=verts, faces=triangles)
 
@@ -205,7 +221,7 @@ def renderScene():
 
 
     conn, cursor = initDBConnection()
-    centerlon, centerlat, minlon, minlat, maxlon, maxlat = getLocationCoordinates(address)
+    centerlon, centerlat, minlon, minlat, maxlon, maxlat = getLocationCoordinates(address, cursor)
 
     downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat, cursor)
     elevation = xr.open_rasterio(os.path.join(baseRasterPath, 'elevation.tif'))[0, :, :]
