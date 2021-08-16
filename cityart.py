@@ -12,12 +12,20 @@ from skimage.transform import resize
 import math
 import tree
 import raster
+import ctypes
+import itertools
+import os
+import string
+import platform
+import usaddress
 
-#address = '7 donnelly rd spencer, ma'
-#address = '1350 Massachusetts Ave, Cambridge, MA 02138'
+
+#address = '7 donnelly rd: spencer: ma'
+#address = '1350 Massachusetts Ave Cambridge MA'
 #address = 'chicago, IL'
 #address = '266 Harding St Worcester, MA 01610'
-address = '166 harding St: Worcester: MA '
+address = '166 harding St Worcester MA'
+#address = '25 Quincy St: Cambridge: MA'
 
 
 width, height = 1500, 1000
@@ -35,13 +43,26 @@ def initDBConnection():
     cursor = conn.cursor()
     return conn, cursor
 
+def getAvailableDrives():
+    if 'Windows' not in platform.system():
+        return []
+    drive_bitmask = ctypes.cdll.kernel32.GetLogicalDrives()
+    return list(itertools.compress(string.ascii_uppercase,
+               map(lambda x:ord(x) - ord('0'), bin(drive_bitmask)[:1:-1])))
+
+
 def getLocationCoordinates(address, cursor):
 
     # convert the address string into formated street, city, state strings.
-    addressItems = address.split(':')
-    street = addressItems[0].strip().title()
-    city = addressItems[1].strip().title()
-    state = addressItems[2].strip().upper()
+    results = usaddress.tag(address)[0]
+    print (results)
+    # OrderedDict([('AddressNumber', '1350'), ('StreetName', 'Massachusetts'), ('StreetNamePostType', 'Ave'), ('PlaceName', 'Cambridge'), ('StateName', 'MA')]
+    street = results['AddressNumber'] + ' ' + results['StreetName'] + ' ' + results['StreetNamePostType']
+    city = results['PlaceName']
+    state = results['StateName']
+    street = street.strip().title()
+    city = city.strip().title()
+    state = state.strip().upper()
 
     print (street, city, state)
     sql = f"select pc_centerlon, pc_centerlat from publicdata.address where address = '{street}' and city = '{city}'" \
@@ -177,7 +198,12 @@ def downloadRasters(centerlon, centerlat, minlon, minlat, maxlon, maxlat, cursor
         bbox = [minlon, maxlon, minlat, maxlat]
 
         rasterList = raster.getRasterList(rasters, bbox, cursor)
-        localRasterList = raster.s3ToLocal(rasterList)
+        drives = getAvailableDrives()
+        if 'E' in drives:
+            localRasterList = raster.s3ToLocal(rasterList)
+        else:
+            # The external hard drive is not plugged in so we grab the elevation data directly from S3.
+            localRasterList = rasterList
         raster.importRasters(localRasterList, baseRasterPath, bbox, outNames=rasters)
 
 def buildTerrain(elevation, minlon, maxlon, minlat, maxlat, scale = 1.0):
